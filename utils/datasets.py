@@ -708,7 +708,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 if nL:
                     labels[:, 1] = 1 - labels[:, 1]
 
-        # additional column for image indices...
+        # additional column for image indices..
         labels_out = torch.zeros((nL, 518))
         
         if nL:
