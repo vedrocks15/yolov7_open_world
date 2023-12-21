@@ -655,7 +655,7 @@ if __name__ == '__main__':
     
     # Open world specific FLAG....
     parser.add_argument('--open-world-emb-size', type=int, default=512, help='size of vectors used for distillation')
-    parser.add_argument('--class_text_vectors', type=str, help='path to the class text encoded vectors from Vision language models')
+    parser.add_argument('--class-text-vectors', type=str, help='path to the class text encoded vectors from Vision language models')
     opt = parser.parse_args()
 
     # Set DDP variables (for distributed training)
