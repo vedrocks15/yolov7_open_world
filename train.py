@@ -311,7 +311,7 @@ def train(hyp, opt, device, tb_writer=None):
                                             prefix=colorstr('train: '))
     # number of batches
     nb = len(dataloader)  
-    print("Total number of steps in an epochs : ",nb)
+    #print("Total number of steps in an epochs : ",nb)
 
     # Process 0
     if rank in [-1, 0]:
