@@ -645,20 +645,16 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
-            if not self.open_world:
-                labels = self.labels[index].copy()
-                if labels.size:  # normalized xywh to pixel xyxy format
-                    labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
-            else:
-                # Loading the corresponding pickle file...
-                l_path = self.labels[index]
-                with open(l_path, 'rb') as handle:
-                    l_dict = pickle.load(handle)
+         
+            # Loading the corresponding pickle file...
+            l_path = self.labels[index]
+            with open(l_path, 'rb') as handle:
+                l_dict = pickle.load(handle)
 
-                # class, x,y,w,h semantic embedding....
-                labels = np.array([l_dict[x].strip().split() for x in l_dict], dtype=np.float32)
-                if labels.size:  # normalized xywh to pixel xyxy format
-                    labels[:, 1:5] = xywhn2xyxy(labels[:, 1:5], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+            # class, x,y,w,h semantic embedding....
+            labels = np.array([l_dict[x].strip().split() for x in l_dict], dtype=np.float32)
+            if labels.size:  # normalized xywh to pixel xyxy format
+                labels[:, 1:5] = xywhn2xyxy(labels[:, 1:5], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
 
         if self.augment:
@@ -713,10 +709,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     labels[:, 1] = 1 - labels[:, 1]
 
         # additional column for image indices...
-        if not self.open_world:
-            labels_out = torch.zeros((nL, 6))
-        else:
-            labels_out = torch.zeros((nL, 518))
+        labels_out = torch.zeros((nL, 518))
         
         if nL:
             labels_out[:, 1:] = torch.from_numpy(labels)
