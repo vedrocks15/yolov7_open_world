@@ -364,10 +364,10 @@ def train(hyp, opt, device, tb_writer=None):
     scaler = amp.GradScaler(enabled=cuda)
     
     # NOTE OTA LOSS IS NOT READY FOR MODEL TRAINING............
-    train_compute_loss_ota = ComputeLossOTA_CLIP(model, clip_text_vectors = train_class_vector)
+    train_compute_loss_ota = ComputeLossOTA_CLIP(model, clip_text_vectors = train_class_vectors)
 
     # 2 different loss function because we could have different number of classes in training & validation
-    train_compute_loss = ComputeLoss_CLIP(model, clip_text_vectors = train_class_vector)  
+    train_compute_loss = ComputeLoss_CLIP(model, clip_text_vectors = train_class_vectors)  
     valid_compute_loss = ComputeLoss_CLIP(model, clip_text_vectors = valid_class_vectors)  
 
     # storing image metrics...
