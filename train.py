@@ -57,6 +57,9 @@ def train(hyp, opt, device, tb_writer=None):
     save_dir, epochs, batch_size, total_batch_size, weights, rank, freeze = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.freeze
 
+    # setting up basic variables
+    start_epoch, best_fitness = 0, 0.0
+    
     # Ensuring open world config files are loaded 
     assert "open_world" in opt.cfg 
 
@@ -288,6 +291,7 @@ def train(hyp, opt, device, tb_writer=None):
     if opt.sync_bn and cuda and rank != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         logger.info('Using SyncBatchNorm()')
+
 
     # Trainloader (<<<<<<UPDATE THIS FUNCTION TO LOAD IMAGE CROP EMBEDDINGS >>>>>>>)
     dataloader, dataset = create_dataloader(train_path, 
