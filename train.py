@@ -123,12 +123,12 @@ def train(hyp, opt, device, tb_writer=None):
         train_class_vectors = {}
         # loading order 
         for cnt, cName in enumerate(train_classes):
-            train_class_vector[cnt] = data_dict["text_vectors"][cName]
+            train_class_vectors[cnt] = data_dict["text_vectors"][cName.strip()]
         
         valid_class_vectors = {}
         # loading order 
         for cnt, cName in enumerate(valid_classes):
-            valid_class_vectors[cnt] = data_dict["text_vectors"][cName]
+            valid_class_vectors[cnt] = data_dict["text_vectors"][cName.strip()]
 
 
     # There is no resume training option in training OPEN world models
@@ -337,7 +337,7 @@ def train(hyp, opt, device, tb_writer=None):
     # yolo loss parameters.....
     hyp['box'] *= 3. / nl  # scale to layers
     # (SCALING FACTOR CHANGED FROM 80 to 65 SINCE WE USE 65 BASE SUPERVISED MODEL)
-    hyp['cls'] *= nc / 65. * 3. / nl  # scale to classes and layers 
+    hyp['cls'] *= train_nc / 65. * 3. / nl  # scale to classes and layers 
     hyp['obj'] *= (imgsz / 640) ** 2 * 3. / nl  # scale to image size and layers
     hyp['label_smoothing'] = opt.label_smoothing
 
@@ -348,13 +348,13 @@ def train(hyp, opt, device, tb_writer=None):
  
     # for open  world case classes don't exist per se....
     model.class_weights = None
-    model.names = names
+    model.names = train_names
 
     # Start training
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
-    maps = np.zeros(nc)  # mAP per class
+    maps = np.zeros(train_nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
