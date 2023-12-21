@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 from utils.general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
 from utils.torch_utils import is_parallel
@@ -581,37 +582,43 @@ class ComputeLoss_CLIP:
                  autobalance=False):
                  
         super(ComputeLoss_CLIP, self).__init__()
-        device = next(model.parameters()).device  # get model device
-        h = model.hyp  # hyperparameters
 
-        self.clip_text_vectors_embeds = torch.from_numpy(clip_text_vectors.values()).to(device)
+        # get model device
+        device = next(model.parameters()).device 
+        # hyperparameters 
+        h = model.hyp  
+
+        # Order is maintained when you extract values from dictionary 
+        self.clip_text_vectors_embeds = torch.from_numpy(np.array(list(clip_text_vectors.values()))).to(device)
         print("Loaded CLIP text classification vectors : ",self.clip_text_vectors_embeds.shape)
 
+        # Defining negative-LL  for text embedding distillation 
         self.nll_Loss = nn.NLLLoss(reduction = "mean")
 
-        # Define criteria (adding weighting criterea from the hyper-parameter file)
-        BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device)) ###
+        # Define criteria (adding weighting criterea from the hyper-parameter file).....
+        BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device)) 
         BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['obj_pw']], device=device))
 
         # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3 
-        # [ reduces the model's high confidence prediction problem]
-        self.cp, self.cn = smooth_BCE(eps=h.get('label_smoothing', 0.0))  # positive, negative BCE targets
+        # [ reduces the model's high confidence prediction problem] (positive, negative BCE targets)
+        self.cp, self.cn = smooth_BCE(eps=h.get('label_smoothing', 0.0))  
 
         # Focal loss (converting node wise sigmoid to focal penalizing)
         g = h['fl_gamma']  
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
 
-        # Extracting the output of detect module (final layer of our model)
-        det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
+        # Extracting the output of Detect() module (final layer of our model)
+        det = model.module.model[-1] if is_parallel(model) else model.model[-1]  
         
-        # weights for various scales of layers ??
-        self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
+        # weights for various scales of layers....
+        self.balance = {3: [4.0,1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
         
         #self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.1, .05])  # P3-P7
         #self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.5, 0.4, .1])  # P3-P7
         
-        self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
+        # stride 16 index
+        self.ssi = list(det.stride).index(16) if autobalance else 0  
         
         # Setting up all loss components....
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, model.gr, h, autobalance
@@ -624,11 +631,14 @@ class ComputeLoss_CLIP:
         
         # Main Loss function call.....
         device = targets.device
-        l_text_loss, lbox, lobj, l_image_loss, lcls = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
+
+        # Defining loss tensor holders....
+        l_text_loss, l_image_loss = torch.zeros(1, device=device), torch.zeros(1, device=device)
+        lbox, lobj, lcls =  torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
         
         # Building targets based on predictions (regular approach)
         tcls, tbox, indices, anchors, crop_embeds = self.build_targets(p, targets)  # targets
-        crop_embeds.to(device)
+
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
@@ -656,23 +666,24 @@ class ComputeLoss_CLIP:
                 predicted_semantic_embeddings = ps[:,5:] 
                 
                 # cosine similarities.....
-                eps = 1e-8
-                pred_n, ct_vec_n = predicted_semantic_embeddings.norm(dim=1)[:, None], self.clip_text_vectors_embeds.norm(dim=1)[:, None]
-                pred_n = pred_n / torch.max(pred_n, eps * torch.ones_like(pred_n))
-                ct_vec_n = ct_vec_n / torch.max(ct_vec_n, eps * torch.ones_like(ct_vec_n))
-                sim_mt = torch.mm(pred_n, ct_vec_n.transpose(0, 1))
-                
+                pred_norm   = predicted_semantic_embeddings / predicted_semantic_embeddings.norm(dim=1)[:, None]
+                ct_vec_norm = self.clip_text_vectors_embeds / self.clip_text_vectors_embeds.norm(dim=1)[:, None]
+                # number of preds x number of classes....
+                sim_mt = torch.mm(pred_norm, ct_vec_norm.transpose(0,1))
+            
                 # softmax normalised each row for estimating clip's text space....
                 softmax_sim_mt = F.softmax(sim_mt, dim = 1)
 
-                # creating target for similarity matrix
-                target_val = torch.full_like(ps[:,5:], 0, device = device)
-                target_val[range(n), tcls[i]] = 1
-                l_text_loss += self.nll_Loss(softmax_sim_mt, target_val)
+                # creating target class indices 1D tensor....
+                target_val = torch.from_numpy(np.array(tcls[i])).to(device) 
+
+                # Text distillation loss
+                l_text_loss += self.nll_Loss(softmax_sim_mt.log(), target_val) 
 
                 # image distillation loss 
-                l_image_loss += F.smooth_l1_loss(predicted_semantic_embeddings, crop_embeds)
-
+                target_img_embs = crop_embeds[i]
+                target_img_embs.to(device)
+                l_image_loss += F.smooth_l1_loss(predicted_semantic_embeddings, target_img_embs)
 
 
             obji = self.BCEobj(pi[..., 4], tobj)
@@ -684,28 +695,32 @@ class ComputeLoss_CLIP:
             self.balance = [x / self.balance[self.ssi] for x in self.balance]
         lbox *= self.hyp['box']
         lobj *= self.hyp['obj']
-        lcls = self.hyp['cls']*(self.hyp['img_l']*l_image_loss + self.hyp['text_l']*l_text_loss)
-        bs = tobj.shape[0]  # batch size
+        lcls  = self.hyp['cls']*(self.hyp['img_l']*l_image_loss + self.hyp['text_l']*l_text_loss)
+        bs    = tobj.shape[0]  # batch size
 
         # Total loss summation .....
         loss = lbox + lobj + lcls
+        # Returning all individual losses.....
         return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
     def build_targets(self, p, targets):
         
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h, class embedding......)
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
-        
-        
+            
         tcls, tbox, indices, anch, crop_embeds = [], [], [], [], []
-        gain = torch.ones(7, device=targets.device).long()  # normalized to gridspace gain
+        # normalized to gridspace gain (6+1 : 1 added due to anchor indices) [HARDCODED VALUES : 512 + 5 + (image_id) + (anchor_index)]
+        gain = torch.ones(519, device=targets.device).long() 
 
         # creating an anchor index of na x nt anchors....
         ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
+        
         # repeating target labels for each anchor : na x nt x (total_label_dim + 1) & append anchor indices
         targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  
 
-        g = 0.5  # bias
+        # bias
+        g = 0.5  
+        
         # grid anchor points adjacent to a given anchor point ....
         off = torch.tensor([[0, 0],
                             [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
@@ -714,13 +729,14 @@ class ComputeLoss_CLIP:
 
         # looping each scale of output layer in the detection head....
         for i in range(self.nl):
+            
             # getting anchor prior dimensions.....
             anchors   = self.anchors[i]
             
             # taking each prediction at each layer 
             gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain (scale dim)
 
-            # Match targets to anchors
+            # Match targets to anchors (only multiplying with regular yolo targets....)
             t = targets * gain
             if nt:
                 # Matches
@@ -756,8 +772,8 @@ class ComputeLoss_CLIP:
             tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
-            crop_embeds.append(t[:,6:])
-
+            crop_embeds.append(t[:,7:]) # embedding vectors for each crop
+    
         return tcls, tbox, indices, anch, crop_embeds
 
 

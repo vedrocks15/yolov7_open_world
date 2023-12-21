@@ -726,6 +726,15 @@ class Model(nn.Module):
             self.stride = m.stride
             self._initialize_biases()  # only run once
             # print('Strides: %s' % m.stride.tolist())
+        if isinstance(m, IDetect_CLIP):
+            s = 256  # 2x min stride
+            # Accessing this member variable of IDetect class..... (computing the amount of downsampling : [i/p / o/p] shape)
+            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            check_anchor_order(m)
+            m.anchors /= m.stride.view(-1, 1, 1)
+            self.stride = m.stride
+            self._initialize_biases()  # only run once
+            # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IAuxDetect):
             s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))[:4]])  # forward
@@ -979,7 +988,8 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         elif m is Foldcut:
             c2 = ch[f] // 2
         # detection head module.....
-        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint]:
+        # added a modified module.....
+        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint, IDetect_CLIP]:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)

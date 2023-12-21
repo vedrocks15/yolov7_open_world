@@ -80,6 +80,7 @@ def create_dataloader(path,
                       prefix=''):
 
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
+    # Open world image embeddings load.....
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, 
                                       imgsz, 
@@ -89,7 +90,6 @@ def create_dataloader(path,
                                       rect=rect,  # rectangular training
                                       cache_images=cache,
                                       single_cls=opt.single_cls,
-                                      open_world = opt.open_world,
                                       stride=int(stride),
                                       pad=pad,
                                       image_weights=image_weights,
@@ -363,20 +363,16 @@ class LoadStreams:  # multiple IP or RTSP cameras
         return 0  # 1E12 frames = 32 streams at 30 FPS for 30 years
 
 
-def img2label_paths(img_paths, open_word_flag):
+def img2label_paths(img_paths):
     """
     No actual loading only paths are feteched....
     """
     # Define label paths as a function of image paths
-    if not open_word_flag:
-        # loading regular txt files
-        sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
-        return ['txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
-    else:
-        # loading pickle files....
-        sa, sb = os.sep + 'images' + os.sep, os.sep + 'label_clip_vectors' + os.sep  # /images/, /labels/ substrings
-        return ['pickle'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
-    
+  
+    # loading pickle files....
+    sa, sb = os.sep + 'images' + os.sep, os.sep + 'label_clip_vectors' + os.sep  # /images/, /labels/ substrings
+    return ['pickle'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
+
 
 
 #<<<<<<<<<<<<<<<<<<<<<< Main DATA LOADER >>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -391,7 +387,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                  image_weights=False,
                  cache_images=False, 
                  single_cls=False, 
-                 open_world = False,
                  stride=32, 
                  pad=0.0, 
                  prefix=''):
@@ -405,9 +400,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path   
-        self.open_world  = open_world
-
-        #self.albumentations = Albumentations() if augment else None
 
         # Handle incorrect image loading scenarios.....
         try:
@@ -429,34 +421,26 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 else:
                     raise Exception(f'{prefix}{p} does not exist')
 
-            # Loading image file Names....     
-            if not self.open_world:
-                self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in img_formats])
-            else:
-                # since not all images have embedding vectors due to some constraints....
-                label_dir_elements = [i.split(".")[0] for i in os.listdir(path.replace("images","label_clip_vectors"))]
-                self.img_files = sorted([x.replace('/', os.sep) for x in f if (x.split('.')[-1].lower() in img_formats) and (x.split("/")[-1].split(".")[0] in  label_dir_elements)])
+            # since not all images have embedding vectors due to some constraints....
+            label_dir_elements = [i.split(".")[0] for i in os.listdir(path.replace("images","label_clip_vectors"))]
+            self.img_files = sorted([x.replace('/', os.sep) for x in f if (x.split('.')[-1].lower() in img_formats) and (x.split("/")[-1].split(".")[0] in  label_dir_elements)])
             
             # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
             
             assert self.img_files, f'{prefix}No images found'
+
         except Exception as e:
             raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
 
         # Check cache (loading only the image label names...)
-        self.label_files = img2label_paths(self.img_files, open_word_flag = self.open_world)  # labels
+        self.label_files = img2label_paths(self.img_files)
 
-        # Making a different type of cache for open world distillation....
-        if not self.open_world:
-            cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
-        else:
-            cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('open_world.cache')  # cached labels
+        # label caching for open world labels....
+        cache_path = Path(str(p if p.is_file() else Path(self.label_files[0]).parent) + "_open_world").with_suffix('.cache')  
         
         # no need to focus on label caching for open world training....
         if cache_path.is_file():
             cache, exists = torch.load(cache_path), True  # load
-            #if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
-            #    cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
         else:
             cache, exists = self.cache_labels(cache_path, prefix), False  # cache
 
@@ -476,10 +460,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # for open world labels would be label paths....
         labels, shapes, self.segments = zip(*cache.values())
         self.labels = list(labels)
-        self.shapes = np.array(shapes, dtype=np.float64) # exif corrected image shapes....
-        # getting image file names & label file names back....
-        self.img_files = list(cache.keys())  # update
-        self.label_files = img2label_paths(cache.keys(), open_word_flag = self.open_world)  # update
+
+        # exif corrected image shapes....
+        self.shapes = np.array(shapes, dtype=np.float64) 
+        # getting image file names & label file names back.... (for consistency purposes)
+        self.img_files = list(cache.keys())  
+        self.label_files = img2label_paths(cache.keys()) 
         
         if single_cls:
             for x in self.labels:
@@ -539,7 +525,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             pbar.close()
 
         
-
     def cache_labels(self, path=Path('./labels.cache'), prefix=''):
         """
         Function to create & store cached labels....
@@ -565,56 +550,36 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 assert im.format.lower() in img_formats, f'invalid image format {im.format}'
 
                 # Label verification.....
-                save_l = lb_file
+                save_l = ""
                 if os.path.isfile(lb_file):
-                    nf += 1  # label found
-                    if not self.open_world:
-                        with open(lb_file, 'r') as f:
-                            
-                            
-                            l = [x.split() for x in f.read().strip().splitlines()]
-                            
-                            if any([len(x) > 8 for x in l]):  # is segment
-                                classes = np.array([x[0] for x in l], dtype=np.float32)
-                                segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
-                                l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
-                            l = np.array(l, dtype=np.float32)
                     
-                        if len(l):
-                            assert l.shape[1] == 5, 'labels require 5 columns each'
-                            assert (l >= 0).all(), 'negative labels'
-                            assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
-                            assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
-                        else:
-                            ne += 1  # label empty
-                            l = np.zeros((0, 5), dtype=np.float32)
+                    # label found    
+                    nf += 1  
+                    # class x,y,w,h [semantic embedding...]
+                    with open(lb_file, 'rb') as handle:
+                        label_dict = pickle.load(handle)
+
+                    # class, x,y,w,h semantic embedding....
+                    l = [label_dict[x].strip().split() for x in label_dict]
+                    l = np.array(l, dtype=np.float32)
+
+                    ####### HARD CODING THE VALUES FOR NOW #######
+                    if len(l):
+                        assert l.shape[1] == 517, 'labels require 517 columns each'
+                        assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
+                        # saving clip label paths in cache & not the actual vector.....
+                        save_l = lb_file
                     else:
-                        
-                        # class x,y,w,h [semantic embedding...]
-                        with open(lb_file, 'rb') as handle:
-                            label_dict = pickle.load(handle)
-
-                        # class, x,y,w,h semantic embedding....
-                        l = [label_dict[x].strip().split() for x in label_dict]
-                        l = np.array(l, dtype=np.float32)
-
-                        # HARD CODING THE VALUES FOR NOW....
-                        if len(l):
-                            assert l.shape[1] == 517, 'labels require 517 columns each'
-                            assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
-                        else:
-                            ne += 1  # label empty
-                            l = np.zeros((0, 517), dtype=np.float32)
+                        ne += 1  # label empty
+                        l = np.zeros((0, 517), dtype=np.float32)
                 else:
                     nm += 1  # label missing
-                    l = np.zeros((0, 5), dtype=np.float32)
+                    l = np.zeros((0, 517), dtype=np.float32)
                     save_l = ""
                 
-                if not self.open_world:
-                    x[im_file] = [l, shape, segments]
-                else:
-                    # can't cache all embedding vectors, takes up too much space....
-                    x[im_file] = [save_l, shape, segments]
+               
+                # can't cache all embedding vectors, takes up too much space....
+                x[im_file] = [save_l, shape, segments]
 
                 
             except Exception as e:
@@ -636,7 +601,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         torch.save(x, path)  
         logging.info(f'{prefix}New cache created: {path}')
         return x
-
 
     def __len__(self):
         return len(self.img_files)
@@ -686,14 +650,13 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 if labels.size:  # normalized xywh to pixel xyxy format
                     labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
             else:
-                # Loading the corresponding pickle file....
-                l_path = self.labels[index].copy()
+                # Loading the corresponding pickle file...
+                l_path = self.labels[index]
                 with open(l_path, 'rb') as handle:
                     l_dict = pickle.load(handle)
 
                 # class, x,y,w,h semantic embedding....
-                labels = [l_dict[x].strip().split() for x in l_dict]
-                labels = np.array(l, dtype=np.float32)
+                labels = np.array([l_dict[x].strip().split() for x in l_dict], dtype=np.float32)
                 if labels.size:  # normalized xywh to pixel xyxy format
                     labels[:, 1:5] = xywhn2xyxy(labels[:, 1:5], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 

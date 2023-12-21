@@ -1,3 +1,11 @@
+"""
+*Update training script for open world based training. This script only supports OPEN world base training.
+Use regular YOLO repo to train closed world supervised models.
+
+Changelog :
+
+version 0.0.1 : Intial changes made for yolo_zsd paper using normal ComputeLoss & no augmentations
+"""
 import argparse
 import logging
 import math
@@ -48,23 +56,29 @@ def train(hyp, opt, device, tb_writer=None):
     save_dir, epochs, batch_size, total_batch_size, weights, rank, freeze = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.freeze
 
-    # Directories
+    # Ensuring open world config files are loaded 
+    assert "open_world" in opt.cfg 
+
+    # Settin up Directories
     wdir = save_dir / 'weights'
     wdir.mkdir(parents=True, exist_ok=True)  # make dir
     last = wdir / 'last.pt'
     best = wdir / 'best.pt'
     results_file = save_dir / 'results.txt'
 
-    # Save run settings
+    # Save run settings (dumping the training settings into the save directory...)
     with open(save_dir / 'hyp.yaml', 'w') as f:
         yaml.dump(hyp, f, sort_keys=False)
     with open(save_dir / 'opt.yaml', 'w') as f:
         yaml.dump(vars(opt), f, sort_keys=False)
 
-    # Configure
-    plots = not opt.evolve  # create plots
+
+    # create plots
+    plots = not opt.evolve  
     cuda = device.type != 'cpu'
     init_seeds(2 + rank)
+
+    # Loading data config parameters....
     with open(opt.data) as f:
         # names of classes....
         data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
@@ -75,84 +89,89 @@ def train(hyp, opt, device, tb_writer=None):
     if rank in [-1, 0]:
         opt.hyp = hyp  # add hyperparameters
         run_id = torch.load(weights, map_location=device).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
+        
+        # Weights and biases logging....
         wandb_logger = WandbLogger(opt, Path(opt.save_dir).stem, run_id, data_dict)
         loggers['wandb'] = wandb_logger.wandb
         data_dict = wandb_logger.data_dict
         if wandb_logger.wandb:
             weights, epochs, hyp = opt.weights, opt.epochs, opt.hyp  # WandbLogger might update weights, epochs if resuming
 
-    nc = 1 if opt.single_cls else int(data_dict['nc'])  # number of classes
-    names = ['item'] if opt.single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
-    assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
+    # Open world training uses 2 settings for number of classes....
+    train_nc = 1 if opt.single_cls else int(data_dict['train_nc'])  
+    valid_nc = 1 if opt.single_cls else int(data_dict['valid_nc'])  
+    train_names = ['item'] if opt.single_cls and len(data_dict['train_names']) != 1 else data_dict['train_names']
+    valid_names = ['item'] if opt.single_cls and len(data_dict['valid_names']) != 1 else data_dict['valid_names']
+    
+    # Sanity checks....
+    assert len(train_names) == train_nc, '%g names found for train nc=%g dataset in %s' % (len(train_names), train_nc, opt.data)
+    assert len(valid_names) == valid_nc, '%g names found for valid nc=%g dataset in %s' % (len(valid_names), valid_nc, opt.data)  
+
+    # This step is done in order to main loading order so that index in labels & order classes.txt 
+    # is mainted.
+    # Loading open world text vectors from CLIP
+    with open(opt.class_text_vectors, 'rb') as handle:
+
+        # train classes orders..
+        train_classes = open(data_dict["train"][:-6] + "classes.txt","r").readlines()
+        valid_classes = open(data_dict["val"][:-6] + "classes.txt","r").readlines()
+
+        # loading all class text vectors....
+        data_dict["text_vectors"] = pickle.load(handle)
+
+        train_class_vectors = {}
+        # loading order 
+        for cnt, cName in enumerate(train_classes):
+            train_class_vector[cnt] = data_dict["text_vectors"][cName]
+        
+        valid_class_vectors = {}
+        # loading order 
+        for cnt, cName in enumerate(valid_classes):
+            valid_class_vectors[cnt] = data_dict["text_vectors"][cName]
 
 
-    if opt.open_world:
-        print("Updating number of classes from {} to {} for open world training.".format(nc, opt.open_world_emb_size))
-        # updating nc
-        nc = opt.open_world_emb_size
+    # There is no resume training option in training OPEN world models
+    # <<<<<<<<<<<<<CAN ADD THAT LATER>>>>>>>>>>>>>>
+    
+    
+    #################### Model (PARTIAL WEIGHT LOADING FOR OPEN WORLD MODELS....) ####################
+    # fresh model instantiation......
+    print("Building a new model : ")
+    model = Model(opt.cfg, 
+                  ch = 3, 
+                  nc = opt.open_world_emb_size, 
+                  anchors = hyp.get('anchors')).to(device) 
 
-        # model check (ensuring open world model config file is being called....)
-        assert "open_world" in opt.cfg 
+    # the open world trianing always starts from supervised pre-trained
+    ckpt = torch.load(opt.weights, map_location=device)
+    exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
 
-        # loading class vectors from parent model....
-        vector_pickle_paths = "/home/AD/vejoshi/yolo_open_world/yolo_coco_dataset_65_15/className_embeddings.pickle"
-        with open(vector_pickle_paths, 'rb') as handle:
-            # the order in which classes.txt is created is the order in which elements of the text pickle are populated
-            data_dict["vectors"] = pickle.load(handle)
-
-            # mapping to be used to get the correct class vector...
-            data_dict["number_to_class"] = {ctr : cName for ctr, cName in enumerate(data_dict["vectors"].keys())}
-            class_vector_dict = {ctr : embVal for ctr, embVal in enumerate(data_dict["vectors"].values())}
-
-    # Model (PARTIAL WEIGHT LOADING FOR OPEN WORLD MODELS....)
-    pretrained = weights.endswith('.pt')
-    if pretrained:
-        print("Starting with pre-trained weights : ",weights)
-        with torch_distributed_zero_first(rank):
-            attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
-        state_dict = ckpt['model'].float().state_dict()  # to FP32
-        state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
-        model.load_state_dict(state_dict, strict=False)  # load
-        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
-    else:
-        # fresh model instantiation......
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-
-        if opt.open_world:
-            print("Fresh OPEN WORLD MODEL....")
-            # the open world trianing always starts from supervised pre-trained
-            weights = "./runs/train/yolov7_normal_unseen_supervised_weights/weights/best.pt"
-            ckpt = torch.load(weights, map_location=device)
-            exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
-
-            # LAYER 105 for corresponds to the object detection HEAD that we are trying to modify....
-            exclude.extend(['model.105.anchors', 'model.105.anchor_grid', 'model.105.m.0.weight', 
-                            'model.105.m.0.bias', 'model.105.m.1.weight', 'model.105.m.1.bias', 
-                            'model.105.m.2.weight', 'model.105.m.2.bias'])
+    # LAYER 105 for corresponds to the object detection HEAD that we are trying to modify....
+    exclude.extend(['model.105.anchors', 'model.105.anchor_grid', 'model.105.m.0.weight', 
+                    'model.105.m.0.bias', 'model.105.m.1.weight', 'model.105.m.1.bias', 
+                    'model.105.m.2.weight', 'model.105.m.2.bias'])
             
-            # loading only the backbone weights + neck weights for supervised YOLO
-            state_dict = ckpt['model'].float().state_dict()  # to FP32
+    # loading only the backbone weights + neck weights for supervised YOLO
+    state_dict = ckpt['model'].float().state_dict()  # to FP32
 
-            # Only loading weights for base & neck.....
-            state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
-            # loading open-world with SUPERVISED YOLO WEIGHTS
-            model.load_state_dict(state_dict, strict=False) 
-            logger.info('Transferred OPEN WORLD : %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
+    # Only loading weights for base & neck.....
+    state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
+    
+    # loading open-world with SUPERVISED YOLO WEIGHTS
+    model.load_state_dict(state_dict, strict=False) 
+    logger.info('Transferred OPEN WORLD : %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights)) 
 
 
-    # distributed GPU training....
+    # distributed GPU training.... NOTE : distributed training bottleneck
     with torch_distributed_zero_first(rank):
-        check_dataset(data_dict)  # check
+        check_dataset(data_dict) 
 
     # dataset path load ....
     train_path = data_dict['train']
-    test_path = data_dict['val']
+    test_path  = data_dict['val']
 
-    # Freeze [custom frozen layers ...]
-    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # parameter names to freeze (full or partial)
+    # Freeze [custom frozen layers ...] : parameter names to freeze (full or partial)
+    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  
     for k, v in model.named_parameters():
         v.requires_grad = True  # train all layers
 
@@ -162,13 +181,13 @@ def train(hyp, opt, device, tb_writer=None):
             v.requires_grad = False
 
     # Training hyper-params definition 
-    # Optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
     logger.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
-    pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
+    # Optimizer parameter groups
+    pg0, pg1, pg2 = [], [], []  
     for k, v in model.named_modules():
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
             pg2.append(v.bias)  # biases
@@ -255,35 +274,7 @@ def train(hyp, opt, device, tb_writer=None):
     # EMA
     ema = ModelEMA(model) if rank in [-1, 0] else None
 
-    # Resume
-    start_epoch, best_fitness = 0, 0.0
-    if pretrained:
-        # Optimizer
-        if ckpt['optimizer'] is not None:
-            optimizer.load_state_dict(ckpt['optimizer'])
-            best_fitness = ckpt['best_fitness']
-
-        # EMA
-        if ema and ckpt.get('ema'):
-            ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
-            ema.updates = ckpt['updates']
-
-        # Results
-        if ckpt.get('training_results') is not None:
-            results_file.write_text(ckpt['training_results'])  # write results.txt
-
-        # Epochs
-        start_epoch = ckpt['epoch'] + 1
-        if opt.resume:
-            assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (weights, epochs)
-        if epochs < start_epoch:
-            logger.info('%s has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
-                        (weights, ckpt['epoch'], epochs))
-            epochs += ckpt['epoch']  # finetune additional epochs
-
-        del ckpt, state_dict
-
-    # Image sizes
+    # Image sizes....
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     nl = model.model[-1].nl  # number of detection layers (used for scaling hyp['obj'])
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
@@ -298,46 +289,24 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('Using SyncBatchNorm()')
 
     # Trainloader (<<<<<<UPDATE THIS FUNCTION TO LOAD IMAGE CROP EMBEDDINGS >>>>>>>)
-    if not opt.open_world:
-        dataloader, dataset = create_dataloader(train_path, 
-                                                imgsz, 
-                                                batch_size, 
-                                                gs, 
-                                                opt,
-                                                hyp=hyp, 
-                                                augment=True, 
-                                                cache=opt.cache_images, 
-                                                rect=opt.rect, 
-                                                rank=rank,
-                                                world_size=opt.world_size, 
-                                                workers=opt.workers,
-                                                image_weights=opt.image_weights, 
-                                                quad=opt.quad, 
-                                                prefix=colorstr('train: '))
-    else:
-        # keeping augmentations off for open world training.... (first phase)
-        dataloader, dataset = create_dataloader(train_path, 
-                                                imgsz, 
-                                                batch_size, 
-                                                gs, 
-                                                opt,
-                                                hyp=hyp, 
-                                                augment=False, 
-                                                cache=opt.cache_images, 
-                                                rect=opt.rect, 
-                                                rank=rank,
-                                                world_size=opt.world_size, 
-                                                workers=opt.workers,
-                                                image_weights=opt.image_weights, 
-                                                quad=opt.quad, 
-                                                prefix=colorstr('train: '))
-
-
-    if not opt.open_world:
-        mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
-        assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
-    
-    nb = len(dataloader)  # number of batches
+    dataloader, dataset = create_dataloader(train_path, 
+                                            imgsz, 
+                                            batch_size, 
+                                            gs, 
+                                            opt,
+                                            hyp=hyp, 
+                                            augment=False, 
+                                            cache=opt.cache_images, 
+                                            rect=opt.rect, 
+                                            rank=rank,
+                                            world_size=opt.world_size, 
+                                            workers=opt.workers,
+                                            image_weights=opt.image_weights, 
+                                            quad=opt.quad, 
+                                            prefix=colorstr('train: '))
+    # number of batches
+    nb = len(dataloader)  
+    print("Total number of steps in an epochs : ",nb)
 
     # Process 0
     if rank in [-1, 0]:
@@ -356,24 +325,6 @@ def train(hyp, opt, device, tb_writer=None):
                                        pad=0.5, 
                                        prefix=colorstr('val: '))[0]
 
-        if not opt.resume:
-
-            if not opt.open_world:
-                # histogram of class distribution for normal case
-                labels = np.concatenate(dataset.labels, 0)
-                c = torch.tensor(labels[:, 0])  # classes
-                # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
-                # model._initialize_biases(cf.to(device))
-                if plots:
-                    #plot_labels(labels, names, save_dir, loggers)
-                    if tb_writer:
-                        tb_writer.add_histogram('classes', c, 0)
-
-            # Anchors
-            if not opt.noautoanchor:
-                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
-            model.half().float()  # pre-reduce anchor precision
-
     # DDP mode (incase rank is speicified)
     if cuda and rank != -1:
         model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank,
@@ -384,20 +335,19 @@ def train(hyp, opt, device, tb_writer=None):
 
     # yolo loss parameters.....
     hyp['box'] *= 3. / nl  # scale to layers
-    hyp['cls'] *= nc / 80. * 3. / nl  # scale to classes and layers
+    # (SCALING FACTOR CHANGED FROM 80 to 65 SINCE WE USE 65 BASE SUPERVISED MODEL)
+    hyp['cls'] *= nc / 65. * 3. / nl  # scale to classes and layers 
     hyp['obj'] *= (imgsz / 640) ** 2 * 3. / nl  # scale to image size and layers
     hyp['label_smoothing'] = opt.label_smoothing
-    model.nc = nc  # attach number of classes to model
-    model.hyp = hyp  # attach hyperparameters to model
-    model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
-    if not opt.open_world:
-        model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
-    else:
-        # for open  world case classes don't exist per se....
-        model.class_weights = None
-    
-    model.names = names
 
+    # Updating model parameters.....
+    model.nc = opt.open_world_emb_size  
+    model.hyp = hyp  
+    model.gr = 1.0  
+ 
+    # for open  world case classes don't exist per se....
+    model.class_weights = None
+    model.names = names
 
     # Start training
     t0 = time.time()
@@ -408,30 +358,28 @@ def train(hyp, opt, device, tb_writer=None):
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     
-    # initialzing loss classes....
-    if not opt.open_world:
-        compute_loss_ota = ComputeLossOTA(model)  # init loss class
-        compute_loss = ComputeLoss(model)  # init loss class
+    # NOTE OTA LOSS IS NOT READY FOR MODEL TRAINING............
+    train_compute_loss_ota = ComputeLossOTA_CLIP(model, clip_text_vectors = train_class_vector)
 
-    else:
-        compute_loss_ota = ComputeLossOTA_CLIP(model, clip_text_vectors = class_vector_dict)
-        compute_loss = ComputeLoss_CLIP(model, clip_text_vectors = class_vector_dict)  # init loss class
+    # 2 different loss function because we could have different number of classes in training & validation
+    train_compute_loss = ComputeLoss_CLIP(model, clip_text_vectors = train_class_vector)  
+    valid_compute_loss = ComputeLoss_CLIP(model, clip_text_vectors = valid_class_vectors)  
 
-    
     # storing image metrics...
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
+
     # intial save....
     torch.save(model, wdir / 'init.pt')
 
 
     # Initiating training sequence .....
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        
         # This operation sets the flag : model.training
         model.train()
-
         # Not focusing on this for open world training....
         # Update image weights (optional)
         if opt.image_weights:
@@ -447,13 +395,12 @@ def train(hyp, opt, device, tb_writer=None):
                 if rank != 0:
                     dataset.indices = indices.cpu().numpy()
 
-        # Update mosaic border
-        # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
-        # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
-
-        mloss = torch.zeros(4, device=device)  # mean losses
+        # mean losses....
+        mloss = torch.zeros(4, device=device)  
+        # For distributed training....
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
+
         pbar = enumerate(dataloader)
         logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
         if rank in [-1, 0]:
@@ -462,7 +409,7 @@ def train(hyp, opt, device, tb_writer=None):
         # intializing back prop...
         optimizer.zero_grad()
 
-        # loading each batch.....
+        # loading al batches in training loop.....
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start) [total count of seen batches]
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
@@ -488,16 +435,20 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Forward (amp : mixed precision training)
             with amp.autocast(enabled=cuda):
-                pred = model(imgs)  # forward pass
+
+                # Forward pass
+                pred = model(imgs)  
 
                 # loss computation (embeddings will be loaded on GPU)
                 if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
-                    loss, loss_items = compute_loss_ota(pred, 
-                                                        targets.to(device), 
-                                                        imgs)  # loss scaled by batch_size
+                    # loss scaled by batch_size
+                    loss, loss_items = train_compute_loss_ota(pred, 
+                                                              targets.to(device), 
+                                                              imgs)  
                 else:
-                    loss, loss_items = compute_loss(pred, 
-                                                    targets.to(device))  # loss scaled by batch_size
+                    # loss scaled by batch_size
+                    loss, loss_items = train_compute_loss(pred, 
+                                                          targets.to(device)) 
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -557,7 +508,7 @@ def train(hyp, opt, device, tb_writer=None):
                                                  verbose=nc < 50 and final_epoch,
                                                  plots=plots and final_epoch,
                                                  wandb_logger=wandb_logger,
-                                                 compute_loss=compute_loss,
+                                                 compute_loss=valid_compute_loss,
                                                  is_coco=is_coco,
                                                  v5_metric=opt.v5_metric)
 
@@ -614,6 +565,7 @@ def train(hyp, opt, device, tb_writer=None):
                 del ckpt
 
         # end epoch ----------------------------------------------------------------------------------------------------
+    
     # end training
     if rank in [-1, 0]:
         # Plots
@@ -656,6 +608,7 @@ def train(hyp, opt, device, tb_writer=None):
     else:
         dist.destroy_process_group()
     torch.cuda.empty_cache()
+    
     return results
 
 
@@ -663,15 +616,15 @@ if __name__ == '__main__':
 
     # Setting Up cmd line arguments....
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default='yolo7.pt', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
-    parser.add_argument('--data', type=str, default='data/coco.yaml', help='data.yaml path')
-    parser.add_argument('--hyp', type=str, default='data/hyp.scratch.p5.yaml', help='hyperparameters path')
-    parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
+    parser.add_argument('--weights', type=str, default='yolo7.pt', help='for open world this should point to a supervised trained YOLO')
+    parser.add_argument('--cfg', type=str, default='', help='model.yaml path (for open world updated YAML file is created)')
+    parser.add_argument('--data', type=str, default='data/coco.yaml', help='data.yaml path (for open world updated YAML file is created)')
+    parser.add_argument('--hyp', type=str, default='data/hyp.scratch.p5.yaml', help='hyperparameters path (for open world updated YAML file is created)')
+    parser.add_argument('--epochs', type=int, default=50, help="less number of epochs for training the final model")
+    parser.add_argument('--batch-size', type=int, default=16, help='use small batch size for open world training since we have embeddings.')
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='[train, test] image sizes')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
-    parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
+    parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training (mostly avoid this)')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')
     parser.add_argument('--noautoanchor', action='store_true', help='disable autoanchor check')
@@ -686,21 +639,23 @@ if __name__ == '__main__':
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--workers', type=int, default=8, help='maximum number of dataloader workers')
-    parser.add_argument('--project', default='runs/train', help='save to project/name')
+    parser.add_argument('--project', default='runs/train', help='save to project/name (automatically handles re-runs)')
     parser.add_argument('--entity', default=None, help='W&B entity')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
-    parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
+    parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon (not useful for open world)')
     parser.add_argument('--upload_dataset', action='store_true', help='Upload dataset as W&B artifact table')
     parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval for W&B')
     parser.add_argument('--save_period', type=int, default=-1, help='Log model after every "save_period" epoch')
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
-    parser.add_argument('--open-world', action='store_true', help='normal yolo or distillation based open world training')
+    
+    # Open world specific FLAG....
     parser.add_argument('--open-world-emb-size', type=int, default=512, help='size of vectors used for distillation')
+    parser.add_argument('--class_text_vectors', type=str, help='path to the class text encoded vectors from Vision language models')
     opt = parser.parse_args()
 
     # Set DDP variables (for distributed training)
@@ -708,13 +663,9 @@ if __name__ == '__main__':
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1 # rank of the gpu in a single node
     set_logging(opt.global_rank)
     
-    #if opt.global_rank in [-1, 0]:
-    #    check_git_status()
-    #    check_requirements()
-
-    # Check point & resume training protocols......
+    # Check point & resume training protocols | resume an interrupted run | 
     wandb_run = check_wandb_resume(opt)
-    if opt.resume and not wandb_run:  # resume an interrupted run
+    if opt.resume and not wandb_run:  
         ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
         assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
         apriori = opt.global_rank, opt.local_rank
@@ -723,17 +674,20 @@ if __name__ == '__main__':
         opt.cfg, opt.weights, opt.resume, opt.batch_size, opt.global_rank, opt.local_rank = '', ckpt, True, opt.total_batch_size, *apriori  # reinstate
         logger.info('Resuming training from %s' % ckpt)
     else:
-        # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
+        # Fresh Start
         opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
         assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
         opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
         opt.name = 'evolve' if opt.evolve else opt.name
         # avoid name clashes while saving parameters....
-        opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
+        opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve) 
 
     # DDP mode (distributed training)
     opt.total_batch_size = opt.batch_size
+    # GPU device name...
     device = select_device(opt.device, batch_size=opt.batch_size)
+    
+    # Distributed Training....
     if opt.local_rank != -1:
         assert torch.cuda.device_count() > opt.local_rank
         torch.cuda.set_device(opt.local_rank)
@@ -748,12 +702,16 @@ if __name__ == '__main__':
 
     # Train (logging metrics)
     logger.info(opt)
+    
     if not opt.evolve:
-        tb_writer = None  # init loggers
+        # init loggers
+        tb_writer = None  
         if opt.global_rank in [-1, 0]:
             prefix = colorstr('tensorboard: ')
             logger.info(f"{prefix}Start with 'tensorboard --logdir {opt.project}', view at http://localhost:6006/")
             tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
+        
+        # Calling the main train function.....
         train(hyp, opt, device, tb_writer)
 
     # Evolve hyperparameters (optional)
