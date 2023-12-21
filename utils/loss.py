@@ -590,7 +590,7 @@ class ComputeLoss_CLIP:
 
         # Order is maintained when you extract values from dictionary 
         self.clip_text_vectors_embeds = torch.from_numpy(np.array(list(clip_text_vectors.values()))).to(device)
-        print("Loaded CLIP text classification vectors : ",self.clip_text_vectors_embeds.shape)
+        #print("Loaded CLIP text classification vectors : ",self.clip_text_vectors_embeds.shape)
 
         # Defining negative-LL  for text embedding distillation 
         self.nll_Loss = nn.NLLLoss(reduction = "mean")
@@ -675,7 +675,7 @@ class ComputeLoss_CLIP:
                 softmax_sim_mt = F.softmax(sim_mt, dim = 1)
 
                 # creating target class indices 1D tensor....
-                target_val = torch.from_numpy(np.array(tcls[i])).to(device) 
+                target_val = tcls[i] 
 
                 # Text distillation loss
                 l_text_loss += self.nll_Loss(softmax_sim_mt.log(), target_val) 
